@@ -1,0 +1,17 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "rewrites": [
+    { "source": "/api/auth/:path*", "destination": "/api/auth?__originalPath=/api/auth/:path*" },
+    { "source": "/api/projects", "destination": "/api/projects?__originalPath=/api/projects" },
+    { "source": "/api/projects/:path*", "destination": "/api/projects?__originalPath=/api/projects/:path*" },
+    { "source": "/api/tasks", "destination": "/api/tasks?__originalPath=/api/tasks" },
+    { "source": "/api/tasks/:path*", "destination": "/api/tasks?__originalPath=/api/tasks/:path*" },
+    { "source": "/api/comments/:path*", "destination": "/api/comments?__originalPath=/api/comments/:path*" },
+    { "source": "/api/reminders/:path*", "destination": "/api/reminders?__originalPath=/api/reminders/:path*" },
+    { "source": "/api/cron/:path*", "destination": "/api/cron?__originalPath=/api/cron/:path*" }
+  ],
+  "crons": [
+    { "path": "/api/cron/reminders", "schedule": "0 3 * * *" }
+  ]
+}
