@@ -1,3 +1,4 @@
+
 import { useDispatch } from 'react-redux';
 import { act } from '../store/tasksSlice.js';
 import { STAGES, formatDate, isPastDue, memberName } from '../utils/helpers.js';
@@ -13,6 +14,10 @@ export default function TaskCard({ task, project, onEdit }) {
   const overdue = task.status !== 'done' && isPastDue(task.deadline);
   const doneCount = task.subtasks.filter((s) => s.done).length;
 
+  // Support both new multi-assignee tasks and older single-assignee tasks.
+  const assignees = task.assignees ??
+    (task.assignee ? [task.assignee] : []);
+
   return (
     <article
       draggable
@@ -21,18 +26,22 @@ export default function TaskCard({ task, project, onEdit }) {
     >
       <div className="flex items-start justify-between gap-2">
         <h3 className="text-sm font-semibold leading-snug">{task.title}</h3>
+
         <span className={`shrink-0 rounded px-1.5 py-0.5 text-xs font-medium ${priorityStyle[task.priority]}`}>
           {task.priority}
         </span>
       </div>
 
-      {task.description && <p className="mt-1 text-xs text-steel">{task.description}</p>}
+      {task.description && (
+        <p className="mt-1 text-xs text-steel">{task.description}</p>
+      )}
 
       {task.subtasks.length > 0 && (
         <div className="mt-2">
           <p className="text-xs text-steel">
             Subtasks {doneCount}/{task.subtasks.length}
           </p>
+
           <ul className="mt-1 space-y-1">
             {task.subtasks.map((s) => (
               <li key={s.id}>
@@ -40,9 +49,18 @@ export default function TaskCard({ task, project, onEdit }) {
                   <input
                     type="checkbox"
                     checked={s.done}
-                    onChange={() => dispatch(act({ type: 'TOGGLE_SUBTASK', taskId: task.id, subId: s.id }))}
+                    onChange={() =>
+                      dispatch(act({
+                        type: 'TOGGLE_SUBTASK',
+                        taskId: task.id,
+                        subId: s.id,
+                      }))
+                    }
                   />
-                  <span className={s.done ? 'text-steel line-through' : ''}>{s.title}</span>
+
+                  <span className={s.done ? 'text-steel line-through' : ''}>
+                    {s.title}
+                  </span>
                 </label>
               </li>
             ))}
@@ -50,32 +68,60 @@ export default function TaskCard({ task, project, onEdit }) {
         </div>
       )}
 
-      <div className="mt-3 flex items-center justify-between text-xs">
+      <div className="mt-3 flex items-start justify-between gap-2 text-xs">
         <span className={overdue ? 'font-medium text-alert' : 'text-steel'}>
           {overdue ? 'Overdue: ' : 'Due '}
           {formatDate(task.deadline)}
         </span>
-        {task.assignee && (
-          <span className="rounded-full bg-teal px-2 py-0.5 text-white" title="Assigned to">
-            {memberName(project, task.assignee)}
-          </span>
-        )}
+
+        <div className="flex flex-wrap justify-end gap-1">
+          {assignees.map((id) => {
+            const member = project.members.find((m) => m.id === id);
+
+            return (
+              <span
+                key={id}
+                className="rounded-full bg-teal px-2 py-0.5 text-white"
+                title={`Assigned to ${member?.name ?? 'member'}`}
+              >
+                {memberName(project, id)}
+              </span>
+            );
+          })}
+        </div>
       </div>
 
       <div className="mt-3 flex items-center gap-2">
-        <label className="sr-only" htmlFor={`move-${task.id}`}>Move task to stage</label>
+        <label className="sr-only" htmlFor={`move-${task.id}`}>
+          Move task to stage
+        </label>
+
         <select
           id={`move-${task.id}`}
           value={task.status}
-          onChange={(e) => dispatch(act({ type: 'MOVE_TASK', id: task.id, status: e.target.value }))}
+          onChange={(e) =>
+            dispatch(act({
+              type: 'MOVE_TASK',
+              id: task.id,
+              status: e.target.value,
+            }))
+          }
           className="flex-1 rounded border border-slate-300 bg-white px-1.5 py-1 text-xs"
         >
           {STAGES.map((s) => (
-            <option key={s.id} value={s.id}>{s.label}</option>
+            <option key={s.id} value={s.id}>
+              {s.label}
+            </option>
           ))}
         </select>
-        <button className="btn-ghost !px-2 !py-1 text-xs" onClick={() => onEdit(task)}>
-          Edit{task.commentCount > 0 ? ` (${task.commentCount} comment${task.commentCount > 1 ? 's' : ''})` : ''}
+
+        <button
+          className="btn-ghost !px-2 !py-1 text-xs"
+          onClick={() => onEdit(task)}
+        >
+          Edit{task.commentCount > 0
+            ? ` (${task.commentCount} comment${task.commentCount > 1 ? 's' : ''})`
+            : ''}
         </button>
       </div>
     </article>
