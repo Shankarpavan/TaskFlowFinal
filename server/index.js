@@ -1,3 +1,4 @@
+
 import './env.js';
 import http from 'node:http';
 import { createHash, randomBytes } from 'node:crypto';
@@ -47,15 +48,30 @@ async function loadTask(taskId, user) {
   return { task, project };
 }
 
-function assertAssignee(project, assigneeId) {
-  if (assigneeId && !project.memberIds.some((m) => same(m, assigneeId))) throw bad('Assignee must be a member of the project');
-}
-
 function toAssignee(v) {
   if (v === '' || v == null) return null;
   const id = oid(String(v));
   if (!id) throw bad('Invalid assignee');
   return id;
+}
+
+function toAssignees(values) {
+  if (!Array.isArray(values)) throw bad('Assignees must be an array');
+  const ids = values.map(toAssignee).filter(Boolean);
+  return ids.filter((id, index) => ids.findIndex((other) => same(other, id)) === index);
+}
+
+function assertAssignees(project, assigneeIds) {
+  for (const assigneeId of assigneeIds ?? []) {
+    if (!project.memberIds.some((m) => same(m, assigneeId))) {
+      throw bad('Every assignee must be a member of the project');
+    }
+  }
+}
+
+function taskAssigneeIds(task) {
+  if (Array.isArray(task.assigneeIds)) return task.assigneeIds;
+  return task.assigneeId ? [task.assigneeId] : [];
 }
 
 /** Removes tasks together with everything that hangs off them (MongoDB has no ON DELETE CASCADE). */
@@ -89,7 +105,9 @@ async function snapshot(userId) {
       projectId: String(t.projectId),
       title: t.title,
       description: t.description,
-      assignee: t.assigneeId ? String(t.assigneeId) : '',
+      assignees: taskAssigneeIds(t).map(String),
+      // Keep the legacy field for older frontend code and integrations.
+      assignee: taskAssigneeIds(t)[0] ? String(taskAssigneeIds(t)[0]) : '',
       deadline: t.deadline,
       priority: t.priority,
       status: t.status,
@@ -122,7 +140,8 @@ function cleanTaskInput(b, { partial }) {
     out.priority = b.priority;
   }
   if (b.reminder !== undefined) out.reminder = Boolean(b.reminder);
-  if (b.assignee !== undefined) out.assigneeId = toAssignee(b.assignee);
+  if (b.assignees !== undefined) out.assigneeIds = toAssignees(b.assignees);
+  else if (b.assignee !== undefined) out.assigneeIds = toAssignees([b.assignee]);
   return out;
 }
 
@@ -135,15 +154,19 @@ function cleanSubtasks(list) {
 
 // Emails are awaited: on Vercel the function is frozen as soon as the response is sent.
 async function notifyAssigned(task, projectName, by) {
-  if (!task.assigneeId || same(task.assigneeId, by._id)) return;
-  const to = await col.users.findOne({ _id: task.assigneeId });
-  if (!to) return;
-  await sendMail({
-    to: to.email,
-    subject: `New task assigned: "${task.title}"`,
-    text: `Hi ${to.name},\n\n${by.name} assigned you the task "${task.title}" in project "${projectName}".` +
-      `${task.deadline ? `\nDeadline: ${formatDeadline(task.deadline)}` : ''}\n`,
-  });
+  const ids = taskAssigneeIds(task);
+  const recipients = ids.filter((id) => !same(id, by._id));
+  if (!recipients.length) return;
+
+  const users = await col.users.find({ _id: { $in: recipients } }).toArray();
+  for (const to of users) {
+    await sendMail({
+      to: to.email,
+      subject: `New task assigned: "${task.title}"`,
+      text: `Hi ${to.name},\n\n${by.name} assigned you the task "${task.title}" in project "${projectName}".` +
+        `${task.deadline ? `\nDeadline: ${formatDeadline(task.deadline)}` : ''}\n`,
+    });
+  }
 }
 
 // ---------- routes ----------
@@ -295,15 +318,21 @@ route('POST', '/api/projects/:id/members', true, async ({ user, params, body }) 
   return snapshot(user._id);
 });
 
+// ---------- MULTI-ASSIGNEE TASK ROUTES ----------
+
 route('POST', '/api/tasks', true, async ({ user, body }) => {
   const project = await requireMember(body.projectId, user._id);
   const data = cleanTaskInput(body, { partial: false });
-  assertAssignee(project, data.assigneeId);
+  const assigneeIds = data.assigneeIds ?? [];
+  assertAssignees(project, assigneeIds);
+
   const task = {
     projectId: project._id,
     title: data.title,
     description: data.description ?? '',
-    assigneeId: data.assigneeId ?? null,
+    assigneeIds,
+    // Legacy compatibility: reminders.js and older clients use assigneeId.
+    assigneeId: assigneeIds[0] ?? null,
     deadline: data.deadline ?? '',
     priority: data.priority ?? 'Medium',
     status: 'todo',
@@ -312,9 +341,14 @@ route('POST', '/api/tasks', true, async ({ user, body }) => {
     commentCount: 0,
     createdAt: now(),
   };
+
   task._id = (await col.tasks.insertOne(task)).insertedId;
-  const who = task.assigneeId ? (await col.users.findOne({ _id: task.assigneeId }))?.name : null;
-  await log(project._id, user, `Task "${task.title}" created${who ? ` and assigned to ${who}` : ''}`);
+
+  const assignedUsers = assigneeIds.length
+    ? await col.users.find({ _id: { $in: assigneeIds } }).toArray()
+    : [];
+  const who = assignedUsers.map((member) => member.name);
+  await log(project._id, user, `Task "${task.title}" created${who.length ? ` and assigned to ${who.join(', ')}` : ''}`);
   await notifyAssigned(task, project.name, user);
   return snapshot(user._id);
 });
@@ -322,20 +356,46 @@ route('POST', '/api/tasks', true, async ({ user, body }) => {
 route('PATCH', '/api/tasks/:id', true, async ({ user, params, body }) => {
   const { task: old, project } = await loadTask(params.id, user);
   const data = cleanTaskInput(body, { partial: true });
-  assertAssignee(project, data.assigneeId);
   const changes = { ...data };
+  const oldAssigneeIds = taskAssigneeIds(old);
+  let newlyAssigned = [];
+
+  if (data.assigneeIds !== undefined) {
+    assertAssignees(project, data.assigneeIds);
+    // Keep the first assignee in the legacy field for existing integrations.
+    changes.assigneeId = data.assigneeIds[0] ?? null;
+    newlyAssigned = data.assigneeIds.filter(
+      (id) => !oldAssigneeIds.some((oldId) => same(oldId, id))
+    );
+  }
+
   if (Array.isArray(body.subtasks)) changes.subtasks = cleanSubtasks(body.subtasks);
   if (Object.keys(changes).length) await col.tasks.updateOne({ _id: old._id }, { $set: changes });
 
-  const assigneeChanged = data.assigneeId !== undefined && !same(data.assigneeId, old.assigneeId) && (data.assigneeId || old.assigneeId);
-  if (assigneeChanged) {
-    const n = data.assigneeId ? (await col.users.findOne({ _id: data.assigneeId }))?.name : 'nobody';
-    await log(old.projectId, user, `"${old.title}" assigned to ${n}`);
+  if (data.assigneeIds !== undefined) {
+    const changed = oldAssigneeIds.length !== data.assigneeIds.length ||
+      oldAssigneeIds.some((id) => !data.assigneeIds.some((nextId) => same(id, nextId)));
+    if (changed) {
+      const assignedUsers = data.assigneeIds.length
+        ? await col.users.find({ _id: { $in: data.assigneeIds } }).toArray()
+        : [];
+      const names = assignedUsers.map((member) => member.name);
+      await log(old.projectId, user, `"${old.title}" assigned to ${names.length ? names.join(', ') : 'nobody'}`);
+    }
   }
+
   if (data.deadline !== undefined && data.deadline !== old.deadline)
     await log(old.projectId, user, `Deadline of "${old.title}" set to ${data.deadline || 'none'}`);
   await log(old.projectId, user, `Task "${data.title ?? old.title}" updated`);
-  if (data.assigneeId && assigneeChanged) await notifyAssigned({ ...old, ...changes }, project.name, user);
+
+  if (newlyAssigned.length) {
+    await notifyAssigned({
+      ...old,
+      ...changes,
+      assigneeIds: newlyAssigned,
+    }, project.name, user);
+  }
+
   return snapshot(user._id);
 });
 
@@ -388,14 +448,19 @@ route('POST', '/api/tasks/:id/comments', true, async ({ user, params, body }) =>
   await col.comments.insertOne({ taskId: task._id, userId: user._id, body: text, createdAt: now() });
   await col.tasks.updateOne({ _id: task._id }, { $inc: { commentCount: 1 } });
   await log(task.projectId, user, `Commented on "${task.title}"`);
-  if (task.assigneeId && !same(task.assigneeId, user._id)) {
-    const to = await col.users.findOne({ _id: task.assigneeId });
-    if (to) await sendMail({
-      to: to.email,
-      subject: `New comment on "${task.title}"`,
-      text: `Hi ${to.name},\n\n${user.name} commented on "${task.title}":\n\n${text}\n`,
-    });
+
+  const commentRecipients = taskAssigneeIds(task).filter((id) => !same(id, user._id));
+  if (commentRecipients.length) {
+    const recipients = await col.users.find({ _id: { $in: commentRecipients } }).toArray();
+    for (const to of recipients) {
+      await sendMail({
+        to: to.email,
+        subject: `New comment on "${task.title}"`,
+        text: `Hi ${to.name},\n\n${user.name} commented on "${task.title}":\n\n${text}\n`,
+      });
+    }
   }
+
   return { comments: await commentRows(task._id), ...(await snapshot(user._id)) };
 });
 
@@ -462,6 +527,7 @@ export async function handler(req, res) {
     });
     res.end(JSON.stringify(obj));
   };
+
   try {
     const url = new URL(req.url, 'http://x');
     const { pathname } = url;
@@ -487,6 +553,7 @@ export async function handler(req, res) {
       });
       return send(200, result);
     }
+
     send(404, { error: 'Not found' });
   } catch (e) {
     if (e instanceof HttpError) return send(e.status, { error: e.message });
